@@ -14,6 +14,7 @@ import org.opensearch.action.admin.indices.rollover.RolloverResponse
 import org.opensearch.action.admin.indices.stats.IndicesStatsRequest
 import org.opensearch.action.admin.indices.stats.IndicesStatsResponse
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse
+import org.opensearch.cluster.metadata.IndexAbstraction
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.unit.TimeValue
 import org.opensearch.core.common.unit.ByteSizeValue
@@ -52,7 +53,7 @@ class AttemptRolloverStep(private val action: RolloverAction) : Step(name) {
             return this
         }
 
-        val (rolloverTarget, isDataStream) = getRolloverTargetOrUpdateInfo(context)
+        val (rolloverTarget, isDataStream, isMaterializedView) = getRolloverTargetOrUpdateInfo(context)
         // If the rolloverTarget is null, we would've already updated the failed info from getRolloverTargetOrUpdateInfo and can return early
         rolloverTarget ?: return this
 
@@ -65,7 +66,7 @@ class AttemptRolloverStep(private val action: RolloverAction) : Step(name) {
             return this
         }
 
-        if (!isDataStream && !preCheckIndexAlias(context, rolloverTarget)) {
+        if (!isDataStream && !isMaterializedView && !preCheckIndexAlias(context, rolloverTarget)) {
             stepStatus = StepStatus.FAILED
             info = mapOf("message" to getFailedPreCheckMessage(indexName))
             return this
@@ -190,15 +191,22 @@ class AttemptRolloverStep(private val action: RolloverAction) : Step(name) {
         },
     ).toMap()
 
-    private fun getRolloverTargetOrUpdateInfo(context: StepContext): Pair<String?, Boolean> {
+    private fun getRolloverTargetOrUpdateInfo(context: StepContext): Triple<String?, Boolean, Boolean> {
         val indexName = context.metadata.index
         val metadata = context.clusterService.state().metadata()
         val indexAbstraction = metadata.indicesLookup[indexName]
         val isDataStreamIndex = indexAbstraction?.parentDataStream != null
+        // A materialized-view generation carries a parent-MV back-pointer, mirroring a data-stream backing index's
+        // parentDataStream. Resolve the rollover target to the MV handle and skip the alias pre-check, exactly as
+        // the data-stream path does; the MV handle resolves to a MATERIALIZED_VIEW abstraction that core's rollover
+        // delegation turns into the engine-owned cut/seal.
+        val parentAbstraction = indexAbstraction?.parentAbstraction
+        val isMaterializedViewIndex = parentAbstraction?.type == IndexAbstraction.Type.MATERIALIZED_VIEW
 
         val rolloverTarget =
             when {
                 isDataStreamIndex -> indexAbstraction?.parentDataStream?.name
+                isMaterializedViewIndex -> parentAbstraction?.name
                 else -> metadata.index(indexName).getRolloverAlias()
             }
 
@@ -209,7 +217,7 @@ class AttemptRolloverStep(private val action: RolloverAction) : Step(name) {
             info = mapOf("message" to message)
         }
 
-        return rolloverTarget to isDataStreamIndex
+        return Triple(rolloverTarget, isDataStreamIndex, isMaterializedViewIndex)
     }
 
     /**

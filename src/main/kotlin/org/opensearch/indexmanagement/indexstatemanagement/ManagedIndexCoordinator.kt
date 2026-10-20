@@ -33,6 +33,7 @@ import org.opensearch.cluster.ClusterChangedEvent
 import org.opensearch.cluster.ClusterState
 import org.opensearch.cluster.ClusterStateListener
 import org.opensearch.cluster.block.ClusterBlockException
+import org.opensearch.cluster.metadata.IndexAbstraction
 import org.opensearch.cluster.metadata.IndexMetadata
 import org.opensearch.cluster.routing.Preference
 import org.opensearch.cluster.service.ClusterService
@@ -347,12 +348,17 @@ class ManagedIndexCoordinator(
                     IndexMetadata.INDEX_HIDDEN_SETTING.get(indexMetadata.settings) || indexName.startsWith(".")
                 val indexAbstraction = clusterState.metadata.indicesLookup[indexName]
                 val isDataStreamIndex = indexAbstraction?.parentDataStream != null
-                if (!isDataStreamIndex && isHiddenIndex) {
+                // A materialized-view generation is hidden/dot-prefixed; exempt it from the hidden-index exclusion the
+                // same way data-stream backing indices are exempt, and manage it under the MV handle name.
+                val parentAbstraction = indexAbstraction?.parentAbstraction
+                val isMaterializedViewIndex = parentAbstraction?.type == IndexAbstraction.Type.MATERIALIZED_VIEW
+                if (!isDataStreamIndex && !isMaterializedViewIndex && isHiddenIndex) {
                     return null
                 }
 
                 return when {
                     isDataStreamIndex -> indexAbstraction?.parentDataStream?.name
+                    isMaterializedViewIndex -> parentAbstraction?.name
                     else -> indexName
                 }
             }
